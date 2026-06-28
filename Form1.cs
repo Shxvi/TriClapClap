@@ -1,5 +1,4 @@
 using System;
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -39,10 +38,8 @@ namespace triclapclap
         }
 
         private AppConfig config = null!;
-        private HashSet<Keys> listenKeys = new HashSet<Keys>();
+        private readonly HashSet<Keys> listenKeys = new HashSet<Keys>();
         private readonly HashSet<Keys> keysCurrentlyDown = new HashSet<Keys>();
-
-        private IntPtr soundBufferPtr = IntPtr.Zero;
 
         private Image[] idleFrames = Array.Empty<Image>();
         private Image[] hitFrames = Array.Empty<Image>();
@@ -64,7 +61,7 @@ namespace triclapclap
         private const int WM_SYSKEYUP = 0x0105;
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-        private LowLevelKeyboardProc _proc;
+        private readonly LowLevelKeyboardProc _proc;
         private IntPtr _hookID = IntPtr.Zero;
 
         private System.Windows.Forms.Timer animationTimer = null!;
@@ -81,14 +78,21 @@ namespace triclapclap
         private Font? cachedFont;
         private Pen? cachedOutlinePen;
         private SolidBrush? cachedTextBrush;
-        private StringFormat cachedStringFormat = null!;
-        private GraphicsPath cachedTextPath = null!;
+        private readonly StringFormat cachedStringFormat;
+        private readonly GraphicsPath cachedTextPath;
+
         private string lastRenderedText = string.Empty;
+        private long lastRenderedHits = -1;
+        private int lastRenderedCps = -1;
 
         private readonly byte[] jsonBuffer = new byte[1024];
-        private ArraySegment<byte> jsonSegment;
+        private readonly MemoryStream jsonStream;
 
         private readonly Action registerHitDelegate;
+
+        private const int AudioChannelCount = 8;
+        private bool isSoundLoaded = false;
+        private string[] mciPlayCommands = null!;
 
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -103,19 +107,15 @@ namespace triclapclap
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string lpModuleName);
 
-        [DllImport("winmm.dll", SetLastError = true)]
-        private static extern bool PlaySound(IntPtr pszSound, IntPtr hmod, uint fdwSound);
-
-        private const uint SND_ASYNC = 0x0001;
-        private const uint SND_MEMORY = 0x0004;
-        private const uint SND_NODEFAULT = 0x0002;
+        [DllImport("winmm.dll", CharSet = CharSet.Auto)]
+        private static extern int mciSendString(string command, StringBuilder? buffer, int bufferSize, IntPtr hwndCallback);
 
         public Form1()
         {
             registerHitDelegate = RegisterHit;
             cachedTextPath = new GraphicsPath();
             cachedStringFormat = new StringFormat();
-            jsonSegment = new ArraySegment<byte>(jsonBuffer);
+            jsonStream = new MemoryStream(jsonBuffer);
 
             LoadConfig();
             InitializeOverlayWindow();
@@ -135,16 +135,17 @@ namespace triclapclap
                 assetsWatcher?.Dispose();
                 StopWebSocketServer();
 
-                if (soundBufferPtr != IntPtr.Zero)
+                for (int i = 0; i < AudioChannelCount; i++)
                 {
-                    Marshal.FreeHGlobal(soundBufferPtr);
+                    mciSendString($"close slapch{i}", null, 0, IntPtr.Zero);
                 }
 
                 cachedFont?.Dispose();
                 cachedOutlinePen?.Dispose();
                 cachedTextBrush?.Dispose();
                 cachedTextPath?.Dispose();
-                cachedStringFormat?.Dispose();
+                cachedStringFormat.Dispose();
+                jsonStream.Dispose();
             };
         }
 
@@ -192,7 +193,10 @@ namespace triclapclap
                 LineJoin = LineJoin.Round
             };
             cachedTextBrush = new SolidBrush(ColorTranslator.FromHtml(config.FontColor));
+
             lastRenderedText = string.Empty;
+            lastRenderedHits = -1;
+            lastRenderedCps = -1;
         }
 
         private void SetupConfigWatcher()
@@ -300,22 +304,26 @@ namespace triclapclap
             }
             hitFrames = hitList.ToArray();
 
-            string soundPath = Path.Combine(assetsDir, "slap.wav");
-            if (soundBufferPtr != IntPtr.Zero)
+            for (int i = 0; i < AudioChannelCount; i++)
             {
-                Marshal.FreeHGlobal(soundBufferPtr);
-                soundBufferPtr = IntPtr.Zero;
+                mciSendString($"close slapch{i}", null, 0, IntPtr.Zero);
             }
+            isSoundLoaded = false;
 
+            string soundPath = Path.Combine(assetsDir, "slap.wav");
             if (File.Exists(soundPath))
             {
                 try
                 {
-                    byte[] soundBytes = File.ReadAllBytes(soundPath);
-                    soundBufferPtr = Marshal.AllocHGlobal(soundBytes.Length);
-                    Marshal.Copy(soundBytes, 0, soundBufferPtr, soundBytes.Length);
+                    mciPlayCommands = new string[AudioChannelCount];
+                    for (int i = 0; i < AudioChannelCount; i++)
+                    {
+                        mciSendString($"open \"{soundPath}\" type waveaudio alias slapch{i}", null, 0, IntPtr.Zero);
+                        mciPlayCommands[i] = $"play slapch{i} from 0";
+                    }
+                    isSoundLoaded = true;
                 }
-                catch { soundBufferPtr = IntPtr.Zero; }
+                catch { isSoundLoaded = false; }
             }
         }
 
@@ -422,18 +430,18 @@ namespace triclapclap
 
         private int SerializeStateToBuffer()
         {
-            var options = new JsonWriterOptions { Indented = false };
-            using (var stream = new MemoryStream(jsonBuffer))
-            using (var writer = new Utf8JsonWriter(stream, options))
+            jsonStream.Position = 0;
+            jsonStream.SetLength(0);
+
+            using (var writer = new Utf8JsonWriter(jsonStream, new JsonWriterOptions { Indented = false }))
             {
                 writer.WriteStartObject();
                 writer.WriteNumber("totalHits", totalHits);
                 writer.WriteNumber("cps", currentCps);
                 writer.WriteString("frame", GetCurrentFrameName());
                 writer.WriteEndObject();
-                writer.Flush();
-                return (int)stream.Position;
             }
+            return (int)jsonStream.Position;
         }
 
         private void BroadcastData()
@@ -505,9 +513,10 @@ namespace triclapclap
                 clickHead = (clickHead + 1) % MaxCpsTrack;
             }
 
-            if (config.IsSoundEnabled && soundBufferPtr != IntPtr.Zero)
+            if (config.IsSoundEnabled && isSoundLoaded)
             {
-                PlaySound(soundBufferPtr, IntPtr.Zero, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                int channel = (int)(totalHits % AudioChannelCount);
+                mciSendString(mciPlayCommands[channel], null, 0, IntPtr.Zero);
             }
 
             if (hitFrames.Length > 0)
@@ -592,16 +601,17 @@ namespace triclapclap
             if (cachedFont == null || cachedOutlinePen == null || cachedTextBrush == null)
                 return;
 
-            string text = string.Format(config.TextFormat, totalHits, currentCps);
-
-            if (text != lastRenderedText)
+            if (totalHits != lastRenderedHits || currentCps != lastRenderedCps || lastRenderedText == string.Empty)
             {
+                lastRenderedText = string.Format(config.TextFormat, totalHits, currentCps);
+                lastRenderedHits = totalHits;
+                lastRenderedCps = currentCps;
+
                 cachedTextPath.Reset();
                 float emSize = g.DpiY * cachedFont.Size / 72;
                 Point pt = new Point(config.TextX, config.TextY);
 
-                cachedTextPath.AddString(text, cachedFont.FontFamily, (int)cachedFont.Style, emSize, pt, cachedStringFormat);
-                lastRenderedText = text;
+                cachedTextPath.AddString(lastRenderedText, cachedFont.FontFamily, (int)cachedFont.Style, emSize, pt, cachedStringFormat);
             }
 
             if (config.IsOutlineEnabled && config.OutlineSize > 0)
