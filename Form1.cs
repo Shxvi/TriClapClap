@@ -1,13 +1,13 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
-using System.Media;
 using System.Net;
 using System.Net.WebSockets;
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -35,21 +35,27 @@ namespace triclapclap
             public int OutlineSize { get; set; } = 2;
             public bool IsTextAboveAssets { get; set; } = false;
             public int WsPort { get; set; } = 8080;
+            public string TextFormat { get; set; } = "hits {0}\ncps {1}";
         }
 
         private AppConfig config = null!;
         private HashSet<Keys> listenKeys = new HashSet<Keys>();
         private readonly HashSet<Keys> keysCurrentlyDown = new HashSet<Keys>();
 
-        private SoundPlayer? slapSound;
-        private MemoryStream? currentSoundStream;
+        private IntPtr soundBufferPtr = IntPtr.Zero;
 
         private Image[] idleFrames = Array.Empty<Image>();
         private Image[] hitFrames = Array.Empty<Image>();
 
         private int currentFrame = 0;
         private long totalHits = 0;
-        private ConcurrentQueue<DateTime> clickTimestamps = new ConcurrentQueue<DateTime>();
+
+        private const int MaxCpsTrack = 512;
+        private readonly long[] clickTicks = new long[MaxCpsTrack];
+        private int clickHead = 0;
+        private int clickTail = 0;
+        private int currentCps = 0;
+        private readonly object tickLock = new object();
 
         private const int WH_KEYBOARD_LL = 13;
         private const int WM_KEYDOWN = 0x0100;
@@ -72,8 +78,45 @@ namespace triclapclap
 
         private readonly string[] hitFileNames = { "PlayArea-Hit-0.png", "PlayArea-Hit-1.png", "PlayArea-Hit-2.png", "PlayArea-Hit-4.png", "PlayArea-Hit-5.png", "PlayArea-Hit-6.png" };
 
+        private Font? cachedFont;
+        private Pen? cachedOutlinePen;
+        private SolidBrush? cachedTextBrush;
+        private StringFormat cachedStringFormat = null!;
+        private GraphicsPath cachedTextPath = null!;
+        private string lastRenderedText = string.Empty;
+
+        private readonly byte[] jsonBuffer = new byte[1024];
+        private ArraySegment<byte> jsonSegment;
+
+        private readonly Action registerHitDelegate;
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("winmm.dll", SetLastError = true)]
+        private static extern bool PlaySound(IntPtr pszSound, IntPtr hmod, uint fdwSound);
+
+        private const uint SND_ASYNC = 0x0001;
+        private const uint SND_MEMORY = 0x0004;
+        private const uint SND_NODEFAULT = 0x0002;
+
         public Form1()
         {
+            registerHitDelegate = RegisterHit;
+            cachedTextPath = new GraphicsPath();
+            cachedStringFormat = new StringFormat();
+            jsonSegment = new ArraySegment<byte>(jsonBuffer);
+
             LoadConfig();
             InitializeOverlayWindow();
             InitializeComponentManual();
@@ -91,7 +134,17 @@ namespace triclapclap
                 configWatcher?.Dispose();
                 assetsWatcher?.Dispose();
                 StopWebSocketServer();
-                currentSoundStream?.Dispose();
+
+                if (soundBufferPtr != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(soundBufferPtr);
+                }
+
+                cachedFont?.Dispose();
+                cachedOutlinePen?.Dispose();
+                cachedTextBrush?.Dispose();
+                cachedTextPath?.Dispose();
+                cachedStringFormat?.Dispose();
             };
         }
 
@@ -100,7 +153,14 @@ namespace triclapclap
             string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
             if (File.Exists(configPath))
             {
-                try { config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(configPath)) ?? new AppConfig(); }
+                try
+                {
+                    config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(configPath)) ?? new AppConfig();
+                    if (config.TextFormat != null)
+                    {
+                        config.TextFormat = config.TextFormat.Replace("\\n", "\n");
+                    }
+                }
                 catch { return; }
             }
             else
@@ -116,6 +176,23 @@ namespace triclapclap
                 if (Enum.TryParse(keyStr.Trim(), true, out Keys key))
                     listenKeys.Add(key);
             }
+
+            UpdateGdiResources();
+        }
+
+        private void UpdateGdiResources()
+        {
+            cachedFont?.Dispose();
+            cachedOutlinePen?.Dispose();
+            cachedTextBrush?.Dispose();
+
+            cachedFont = new Font(config.FontName, config.FontSize, FontStyle.Bold);
+            cachedOutlinePen = new Pen(ColorTranslator.FromHtml(config.OutlineColor), config.OutlineSize * 2)
+            {
+                LineJoin = LineJoin.Round
+            };
+            cachedTextBrush = new SolidBrush(ColorTranslator.FromHtml(config.FontColor));
+            lastRenderedText = string.Empty;
         }
 
         private void SetupConfigWatcher()
@@ -210,7 +287,7 @@ namespace triclapclap
             var idleList = new List<Image>();
             foreach (var name in new[] { "PlayArea-0.png", "PlayArea-1.png" })
             {
-                var img = LoadImageWithoutLock(Path.Combine(assetsDir, name));
+                var img = LoadAndScaleImage(Path.Combine(assetsDir, name), this.Width, this.Height);
                 if (img != null) idleList.Add(img);
             }
             idleFrames = idleList.ToArray();
@@ -218,46 +295,48 @@ namespace triclapclap
             var hitList = new List<Image>();
             foreach (var name in hitFileNames)
             {
-                var img = LoadImageWithoutLock(Path.Combine(assetsDir, name));
+                var img = LoadAndScaleImage(Path.Combine(assetsDir, name), this.Width, this.Height);
                 if (img != null) hitList.Add(img);
             }
             hitFrames = hitList.ToArray();
 
             string soundPath = Path.Combine(assetsDir, "slap.wav");
+            if (soundBufferPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(soundBufferPtr);
+                soundBufferPtr = IntPtr.Zero;
+            }
+
             if (File.Exists(soundPath))
             {
                 try
                 {
                     byte[] soundBytes = File.ReadAllBytes(soundPath);
-                    currentSoundStream?.Dispose();
-                    currentSoundStream = new MemoryStream(soundBytes);
-                    slapSound = new SoundPlayer(currentSoundStream);
-                    slapSound.Load();
+                    soundBufferPtr = Marshal.AllocHGlobal(soundBytes.Length);
+                    Marshal.Copy(soundBytes, 0, soundBufferPtr, soundBytes.Length);
                 }
-                catch
-                {
-                    slapSound = null;
-                }
+                catch { soundBufferPtr = IntPtr.Zero; }
             }
         }
 
-        private Image? LoadImageWithoutLock(string filePath)
+        private Image? LoadAndScaleImage(string filePath, int targetWidth, int targetHeight)
         {
             if (!File.Exists(filePath)) return null;
             try
             {
                 using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var originalBmp = new Bitmap(stream))
                 {
-                    using (var bmp = new Bitmap(stream))
+                    Bitmap scaledBmp = new Bitmap(targetWidth, targetHeight);
+                    using (Graphics g = Graphics.FromImage(scaledBmp))
                     {
-                        return new Bitmap(bmp);
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(originalBmp, 0, 0, targetWidth, targetHeight);
                     }
+                    return scaledBmp;
                 }
             }
-            catch
-            {
-                return null;
-            }
+            catch { return null; }
         }
 
         private void StartWebSocketServer()
@@ -341,13 +420,28 @@ namespace triclapclap
             return "PlayArea-0.png";
         }
 
+        private int SerializeStateToBuffer()
+        {
+            var options = new JsonWriterOptions { Indented = false };
+            using (var stream = new MemoryStream(jsonBuffer))
+            using (var writer = new Utf8JsonWriter(stream, options))
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("totalHits", totalHits);
+                writer.WriteNumber("cps", currentCps);
+                writer.WriteString("frame", GetCurrentFrameName());
+                writer.WriteEndObject();
+                writer.Flush();
+                return (int)stream.Position;
+            }
+        }
+
         private void BroadcastData()
         {
             if (activeSockets.IsEmpty) return;
 
-            var packet = new { totalHits = totalHits, cps = clickTimestamps.Count, frame = GetCurrentFrameName() };
-            byte[] jsonBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
-            var segment = new ArraySegment<byte>(jsonBytes);
+            int bytesWritten = SerializeStateToBuffer();
+            var segment = new ArraySegment<byte>(jsonBuffer, 0, bytesWritten);
 
             foreach (var ws in activeSockets.Keys)
             {
@@ -360,9 +454,8 @@ namespace triclapclap
 
         private Task SendStateToSocket(WebSocket ws)
         {
-            var packet = new { totalHits = totalHits, cps = clickTimestamps.Count, frame = GetCurrentFrameName() };
-            byte[] jsonBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
-            return ws.SendAsync(new ArraySegment<byte>(jsonBytes), WebSocketMessageType.Text, true, CancellationToken.None);
+            int bytesWritten = SerializeStateToBuffer();
+            return ws.SendAsync(new ArraySegment<byte>(jsonBuffer, 0, bytesWritten), WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
         private IntPtr SetHook(LowLevelKeyboardProc proc)
@@ -389,7 +482,7 @@ namespace triclapclap
                         if (!keysCurrentlyDown.Contains(key))
                         {
                             keysCurrentlyDown.Add(key);
-                            this.BeginInvoke(new Action(() => RegisterHit()));
+                            this.BeginInvoke(registerHitDelegate);
                         }
                     }
                     else if (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP)
@@ -404,11 +497,17 @@ namespace triclapclap
         private void RegisterHit()
         {
             totalHits++;
-            clickTimestamps.Enqueue(DateTime.Now);
 
-            if (config.IsSoundEnabled)
+            long nowTicks = Environment.TickCount64;
+            lock (tickLock)
             {
-                try { slapSound?.Play(); } catch { }
+                clickTicks[clickHead] = nowTicks;
+                clickHead = (clickHead + 1) % MaxCpsTrack;
+            }
+
+            if (config.IsSoundEnabled && soundBufferPtr != IntPtr.Zero)
+            {
+                PlaySound(soundBufferPtr, IntPtr.Zero, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
             }
 
             if (hitFrames.Length > 0)
@@ -435,15 +534,28 @@ namespace triclapclap
 
         private void UiTimer_Tick(object? sender, EventArgs e)
         {
-            DateTime now = DateTime.Now;
+            long now = Environment.TickCount64;
             bool changed = false;
-            while (clickTimestamps.TryPeek(out DateTime stamp) && (now - stamp).TotalSeconds > 1.0)
+
+            lock (tickLock)
             {
-                clickTimestamps.TryDequeue(out _);
-                changed = true;
+                while (clickTail != clickHead && (now - clickTicks[clickTail]) > 1000)
+                {
+                    clickTail = (clickTail + 1) % MaxCpsTrack;
+                }
+
+                int count = (clickHead >= clickTail)
+                    ? (clickHead - clickTail)
+                    : (MaxCpsTrack - clickTail + clickHead);
+
+                if (count != currentCps)
+                {
+                    currentCps = count;
+                    changed = true;
+                }
             }
 
-            if (changed || activeSockets.Count > 0)
+            if (changed)
             {
                 this.Invalidate();
                 BroadcastData();
@@ -453,7 +565,6 @@ namespace triclapclap
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
 
             if (config.IsTextAboveAssets)
             {
@@ -473,45 +584,31 @@ namespace triclapclap
             if (animationTimer.Enabled && currentFrame < hitFrames.Length) currentImage = hitFrames[currentFrame];
             else if (idleFrames.Length > 0) currentImage = idleFrames[0];
 
-            if (currentImage != null) g.DrawImage(currentImage, 0, 0, this.Width, this.Height);
+            if (currentImage != null) g.DrawImage(currentImage, 0, 0);
         }
 
         private void DrawTextOverlay(Graphics g)
         {
-            string text = $"hits {totalHits}\ncps {clickTimestamps.Count}";
-            using (Font font = new Font(config.FontName, config.FontSize, FontStyle.Bold))
+            if (cachedFont == null || cachedOutlinePen == null || cachedTextBrush == null)
+                return;
+
+            string text = string.Format(config.TextFormat, totalHits, currentCps);
+
+            if (text != lastRenderedText)
             {
-                Color foreColor = ColorTranslator.FromHtml(config.FontColor);
-                Color outlineColor = ColorTranslator.FromHtml(config.OutlineColor);
-                Rectangle rect = new Rectangle(config.TextX, config.TextY, this.Width - config.TextX, this.Height - config.TextY);
-                TextFormatFlags flags = TextFormatFlags.Default;
+                cachedTextPath.Reset();
+                float emSize = g.DpiY * cachedFont.Size / 72;
+                Point pt = new Point(config.TextX, config.TextY);
 
-                if (config.IsOutlineEnabled && config.OutlineSize > 0)
-                {
-                    for (int x = -config.OutlineSize; x <= config.OutlineSize; x++)
-                    {
-                        for (int y = -config.OutlineSize; y <= config.OutlineSize; y++)
-                        {
-                            if (Math.Abs(x) + Math.Abs(y) > 0)
-                            {
-                                Rectangle outlineRect = new Rectangle(rect.X + x, rect.Y + y, rect.Width, rect.Height);
-                                TextRenderer.DrawText(g, text, font, outlineRect, outlineColor, flags);
-                            }
-                        }
-                    }
-                }
-                TextRenderer.DrawText(g, text, font, rect, foreColor, flags);
+                cachedTextPath.AddString(text, cachedFont.FontFamily, (int)cachedFont.Style, emSize, pt, cachedStringFormat);
+                lastRenderedText = text;
             }
-        }
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string lpModuleName);
+            if (config.IsOutlineEnabled && config.OutlineSize > 0)
+            {
+                g.DrawPath(cachedOutlinePen, cachedTextPath);
+            }
+            g.FillPath(cachedTextBrush, cachedTextPath);
+        }
     }
 }
