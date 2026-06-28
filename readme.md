@@ -8,8 +8,8 @@ A lightweight input overlay application for OBS Studio.
 * **WebSocket Server:** Real-time broadcasting of animation frames and counters for seamless Browser Source integration.
 
 ---
-
-## Method 1: Browser Source Integration (Recommended)
+## How to use
+### Method 1: Browser Source Integration (Recommended)
 *Provides perfect alpha-transparency for character assets without chroma key artifacts.*
 
 1. Run `triclapclap.exe`.
@@ -19,9 +19,7 @@ A lightweight input overlay application for OBS Studio.
 
 > 📌 **Note:** The provided `index.html` is a baseline template. Feel free to modify its CSS layout and design as needed.
 
----
-
-## Method 2: Window Capture (Alternative)
+### Method 2: Window Capture (Alternative)
 1. Run `triclapclap.exe`.
 2. Add a **Window Capture** source in OBS.
 3. Select the `triclapclap` window from the list.
