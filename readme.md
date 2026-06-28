@@ -25,3 +25,16 @@ A lightweight input overlay application for OBS Studio.
 3. Select the `triclapclap` window from the list.
 4. Right-click the source -> **Filters**.
 5. Add a **Chroma Key** filter to clear the background color defined in your config.
+
+## Building the Application
+
+### Method 1: Via Visual Studio
+1. Open the project file (`.csproj`) or solution file (`.sln`) in Visual Studio.
+2. Set the build configuration to **Release** in the top toolbar.
+3. Build the solution by pressing **`Ctrl + Shift + B`** (or via *Build -> Build Solution*).
+
+### Method 2: Via .NET CLI
+Run the following command in the project root directory (where the `.csproj` resides):
+```bash
+dotnet build -c Release
+```
