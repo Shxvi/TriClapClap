@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -9,7 +8,6 @@ using System.Net;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -21,6 +19,7 @@ namespace triclapclap
         private class AppConfig
         {
             public string TargetKeys { get; set; } = "Z,X";
+            public bool ListenToAllKeys { get; set; } = false;
             public int AnimationDelayMs { get; set; } = 40;
             public string ChromaKeyColor { get; set; } = "#00FF00";
             public string FontColor { get; set; } = "#FFFFFF";
@@ -92,11 +91,10 @@ namespace triclapclap
         private int lastRenderedCps = -1;
 
         private readonly byte[] jsonBuffer = new byte[1024];
-        private readonly MemoryStream jsonStream;
 
         private readonly Action registerHitDelegate;
 
-        private const int AudioChannelCount = 8;
+        private const int AudioChannelCount = 4;
         private bool isSoundLoaded = false;
         private string[] mciPlayCommands = null!;
 
@@ -111,7 +109,7 @@ namespace triclapclap
         private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string lpModuleName);
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
 
         [DllImport("winmm.dll", CharSet = CharSet.Auto)]
         private static extern int mciSendString(string command, StringBuilder? buffer, int bufferSize, IntPtr hwndCallback);
@@ -125,7 +123,6 @@ namespace triclapclap
             registerHitDelegate = RegisterHit;
             cachedTextPath = new GraphicsPath();
             cachedStringFormat = new StringFormat();
-            jsonStream = new MemoryStream(jsonBuffer);
 
             LoadConfig();
             LoadTotalHits();
@@ -158,7 +155,6 @@ namespace triclapclap
                 cachedTextBrush?.Dispose();
                 cachedTextPath?.Dispose();
                 cachedStringFormat.Dispose();
-                jsonStream.Dispose();
             };
 
             AppDomain.CurrentDomain.ProcessExit += (s, e) => SaveTotalHits();
@@ -180,7 +176,7 @@ namespace triclapclap
 
         protected override void SetVisibleCore(bool value)
         {
-            base.SetVisibleCore(isHeadless ? false : value);
+            base.SetVisibleCore(!isHeadless && value);
         }
 
         private void LoadTotalHits()
@@ -210,7 +206,7 @@ namespace triclapclap
             {
                 try
                 {
-                    config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(configPath)) ?? new AppConfig();
+                    config = System.Text.Json.JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(configPath)) ?? new AppConfig();
                     if (config.TextFormat != null)
                     {
                         config.TextFormat = config.TextFormat.Replace("\\n", "\n");
@@ -221,15 +217,18 @@ namespace triclapclap
             else
             {
                 config = new AppConfig();
-                File.WriteAllText(configPath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
+                File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(config, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
             }
 
             listenKeys.Clear();
             keysCurrentlyDown.Clear();
-            foreach (var keyStr in config.TargetKeys.Split(','))
+            if (config.TargetKeys != null)
             {
-                if (Enum.TryParse(keyStr.Trim(), true, out Keys key))
-                    listenKeys.Add(key);
+                foreach (var keyStr in config.TargetKeys.Split(','))
+                {
+                    if (Enum.TryParse(keyStr.Trim(), true, out Keys key))
+                        listenKeys.Add(key);
+                }
             }
 
             UpdateGdiResources();
@@ -326,17 +325,35 @@ namespace triclapclap
             this.DoubleBuffered = true;
             this.BackColor = ColorTranslator.FromHtml(config.ChromaKeyColor);
 
+            Icon? appIcon = null;
+            string localIcoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app.ico");
+
+            if (File.Exists(localIcoPath))
+            {
+                try { appIcon = new Icon(localIcoPath); } catch { }
+            }
+
+            if (appIcon == null)
+            {
+                try { appIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            }
+
+            if (appIcon != null)
+            {
+                this.Icon = appIcon;
+            }
+
             if (isHeadless)
             {
                 trayIcon = new NotifyIcon
                 {
-                    Icon = SystemIcons.Application,
+                    Icon = appIcon ?? SystemIcons.Application,
                     Text = "triclapclap (Headless)",
                     Visible = true
                 };
 
                 ContextMenuStrip trayMenu = new ContextMenuStrip();
-                trayMenu.Items.Add("Exit", null, (s, e) => this.Close());
+                trayMenu.Items.Add("Выход", null, (s, e) => this.Close());
                 trayIcon.ContextMenuStrip = trayMenu;
             }
         }
@@ -390,7 +407,7 @@ namespace triclapclap
                     for (int i = 0; i < AudioChannelCount; i++)
                     {
                         mciSendString($"open \"{soundPath}\" type waveaudio alias slapch{i}", null, 0, IntPtr.Zero);
-                        mciPlayCommands[i] = $"play slapch{i} from 0";
+                        mciPlayCommands[i] = "play slapch" + i + " from 0";
                     }
                     isSoundLoaded = true;
                 }
@@ -501,19 +518,9 @@ namespace triclapclap
 
         private int SerializeStateToBuffer(bool playSoundEvent)
         {
-            jsonStream.Position = 0;
-            jsonStream.SetLength(0);
-
-            using (var writer = new Utf8JsonWriter(jsonStream, new JsonWriterOptions { Indented = false }))
-            {
-                writer.WriteStartObject();
-                writer.WriteNumber("totalHits", totalHits);
-                writer.WriteNumber("cps", currentCps);
-                writer.WriteString("frame", GetCurrentFrameName());
-                writer.WriteBoolean("playSound", playSoundEvent && config.IsSoundStreamEnabled);
-                writer.WriteEndObject();
-            }
-            return (int)jsonStream.Position;
+            string playSoundStr = (playSoundEvent && config.IsSoundStreamEnabled) ? "true" : "false";
+            string json = "{\"totalHits\":" + totalHits + ",\"cps\":" + currentCps + ",\"frame\":\"" + GetCurrentFrameName() + "\",\"playSound\":" + playSoundStr + "}";
+            return Encoding.UTF8.GetBytes(json, 0, json.Length, jsonBuffer, 0);
         }
 
         private void BroadcastData(bool playSoundEvent)
@@ -540,12 +547,7 @@ namespace triclapclap
 
         private IntPtr SetHook(LowLevelKeyboardProc proc)
         {
-            using (Process curProcess = Process.GetCurrentProcess())
-            using (ProcessModule? curModule = curProcess.MainModule)
-            {
-                string moduleName = curModule?.ModuleName ?? "app.exe";
-                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(moduleName), 0);
-            }
+            return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
         }
 
         private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -555,7 +557,7 @@ namespace triclapclap
                 int vkCode = Marshal.ReadInt32(lParam);
                 Keys key = (Keys)vkCode;
 
-                if (listenKeys.Contains(key))
+                if (config.ListenToAllKeys || listenKeys.Contains(key))
                 {
                     if (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN)
                     {
