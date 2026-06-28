@@ -23,6 +23,9 @@ A lightweight input overlay application for OBS Studio
 
 > 📌 **Note:** To hear sound only on the stream, set `"IsSoundLocalEnabled": false` and `"IsSoundStreamEnabled": true` inside `config.json`.
 
+### Headless Mode (Tray Execution)
+When utilizing **Method 1**, the desktop window can be suppressed completely to save system resources. Use `-h` or `--headless` flags when executing the application or create shortcut with this flag
+
 ### Method 2: Window Capture (Alternative)
 1. Run `triclapclap.exe`.
 2. Add a **Window Capture** source in OBS.
