@@ -1,9 +1,12 @@
 name: Build and Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_version:
+        description: 'Версия релиза (например: v1.0.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,33 +14,39 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Create and Push Tag
+      shell: powershell
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git tag "${{ github.event.inputs.tag_version }}"
+        git push origin "${{ github.event.inputs.tag_version }}"
 
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '10.0.x'
 
-    - name: Restore Dependencies
-      run: dotnet restore
-
     - name: Build Application
       run: dotnet build -c Release
 
-    - name: Package Release Asset
+    - name: Package Release
       shell: powershell
       run: |
         Copy-Item -Path "config.json" -Destination "bin\Release\net10.0-windows\" -ErrorAction SilentlyContinue
         Copy-Item -Path "index.html" -Destination "bin\Release\net10.0-windows\" -ErrorAction SilentlyContinue
-        
-        Compress-Archive -Path "bin\Release\net10.0-windows\*" -DestinationPath "triclapclap-${{ github.ref_name }}.zip"
+        Compress-Archive -Path "bin\Release\net10.0-windows\*" -DestinationPath "triclapclap-${{ github.event.inputs.tag_version }}.zip"
 
-    - name: Create GitHub Release
+    - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        files: triclapclap-${{ github.ref_name }}.zip
+        tag_name: ${{ github.event.inputs.tag_version }}
+        files: triclapclap-${{ github.event.inputs.tag_version }}.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
