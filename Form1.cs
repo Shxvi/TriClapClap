@@ -28,7 +28,8 @@ namespace triclapclap
             public int FontSize { get; set; } = 28;
             public int TextX { get; set; } = 20;
             public int TextY { get; set; } = 20;
-            public bool IsSoundEnabled { get; set; } = true;
+            public bool IsSoundLocalEnabled { get; set; } = true;
+            public bool IsSoundStreamEnabled { get; set; } = true;
             public bool IsOutlineEnabled { get; set; } = true;
             public string OutlineColor { get; set; } = "#000000";
             public int OutlineSize { get; set; } = 2;
@@ -428,7 +429,7 @@ namespace triclapclap
             return "PlayArea-0.png";
         }
 
-        private int SerializeStateToBuffer()
+        private int SerializeStateToBuffer(bool playSoundEvent)
         {
             jsonStream.Position = 0;
             jsonStream.SetLength(0);
@@ -439,16 +440,17 @@ namespace triclapclap
                 writer.WriteNumber("totalHits", totalHits);
                 writer.WriteNumber("cps", currentCps);
                 writer.WriteString("frame", GetCurrentFrameName());
+                writer.WriteBoolean("playSound", playSoundEvent && config.IsSoundStreamEnabled);
                 writer.WriteEndObject();
             }
             return (int)jsonStream.Position;
         }
 
-        private void BroadcastData()
+        private void BroadcastData(bool playSoundEvent)
         {
             if (activeSockets.IsEmpty) return;
 
-            int bytesWritten = SerializeStateToBuffer();
+            int bytesWritten = SerializeStateToBuffer(playSoundEvent);
             var segment = new ArraySegment<byte>(jsonBuffer, 0, bytesWritten);
 
             foreach (var ws in activeSockets.Keys)
@@ -462,7 +464,7 @@ namespace triclapclap
 
         private Task SendStateToSocket(WebSocket ws)
         {
-            int bytesWritten = SerializeStateToBuffer();
+            int bytesWritten = SerializeStateToBuffer(false);
             return ws.SendAsync(new ArraySegment<byte>(jsonBuffer, 0, bytesWritten), WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
@@ -513,7 +515,7 @@ namespace triclapclap
                 clickHead = (clickHead + 1) % MaxCpsTrack;
             }
 
-            if (config.IsSoundEnabled && isSoundLoaded)
+            if (config.IsSoundLocalEnabled && isSoundLoaded)
             {
                 int channel = (int)(totalHits % AudioChannelCount);
                 mciSendString(mciPlayCommands[channel], null, 0, IntPtr.Zero);
@@ -527,7 +529,7 @@ namespace triclapclap
             }
 
             this.Invalidate();
-            BroadcastData();
+            BroadcastData(playSoundEvent: true);
         }
 
         private void AnimationTimer_Tick(object? sender, EventArgs e)
@@ -538,7 +540,7 @@ namespace triclapclap
                 animationTimer.Stop();
             }
             this.Invalidate();
-            BroadcastData();
+            BroadcastData(playSoundEvent: false);
         }
 
         private void UiTimer_Tick(object? sender, EventArgs e)
@@ -567,7 +569,7 @@ namespace triclapclap
             if (changed)
             {
                 this.Invalidate();
-                BroadcastData();
+                BroadcastData(playSoundEvent: false);
             }
         }
 
