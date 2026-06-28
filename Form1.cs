@@ -47,6 +47,9 @@ namespace triclapclap
 
         private int currentFrame = 0;
         private long totalHits = 0;
+        private long lastSavedHits = 0;
+        private long lastSaveTicks = 0;
+        private bool isHeadless = false;
 
         private const int MaxCpsTrack = 512;
         private readonly long[] clickTicks = new long[MaxCpsTrack];
@@ -73,6 +76,8 @@ namespace triclapclap
         private HttpListener? httpListener;
         private readonly ConcurrentDictionary<WebSocket, byte> activeSockets = new ConcurrentDictionary<WebSocket, byte>();
         private int activeWsPort = 0;
+
+        private NotifyIcon? trayIcon;
 
         private readonly string[] hitFileNames = { "PlayArea-Hit-0.png", "PlayArea-Hit-1.png", "PlayArea-Hit-2.png", "PlayArea-Hit-4.png", "PlayArea-Hit-5.png", "PlayArea-Hit-6.png" };
 
@@ -113,12 +118,17 @@ namespace triclapclap
 
         public Form1()
         {
+            ParseCommandLineArgs();
+
+            _ = this.Handle;
+
             registerHitDelegate = RegisterHit;
             cachedTextPath = new GraphicsPath();
             cachedStringFormat = new StringFormat();
             jsonStream = new MemoryStream(jsonBuffer);
 
             LoadConfig();
+            LoadTotalHits();
             InitializeOverlayWindow();
             InitializeComponentManual();
             LoadAssets();
@@ -131,10 +141,12 @@ namespace triclapclap
 
             FormClosing += (s, e) =>
             {
+                SaveTotalHits();
                 UnhookWindowsHookEx(_hookID);
                 configWatcher?.Dispose();
                 assetsWatcher?.Dispose();
                 StopWebSocketServer();
+                trayIcon?.Dispose();
 
                 for (int i = 0; i < AudioChannelCount; i++)
                 {
@@ -148,6 +160,47 @@ namespace triclapclap
                 cachedStringFormat.Dispose();
                 jsonStream.Dispose();
             };
+
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => SaveTotalHits();
+        }
+
+        private void ParseCommandLineArgs()
+        {
+            string[] args = Environment.GetCommandLineArgs();
+            foreach (var arg in args)
+            {
+                if (arg == "-h" || arg == "--headless")
+                {
+                    isHeadless = true;
+                    this.ShowInTaskbar = false;
+                    this.WindowState = FormWindowState.Minimized;
+                }
+            }
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            base.SetVisibleCore(isHeadless ? false : value);
+        }
+
+        private void LoadTotalHits()
+        {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "total_hits.txt");
+            if (File.Exists(path) && long.TryParse(File.ReadAllText(path), out long savedHits))
+            {
+                totalHits = savedHits;
+                lastSavedHits = savedHits;
+            }
+        }
+
+        private void SaveTotalHits()
+        {
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "total_hits.txt");
+                File.WriteAllText(path, totalHits.ToString());
+            }
+            catch { }
         }
 
         private void LoadConfig()
@@ -250,15 +303,18 @@ namespace triclapclap
             this.BeginInvoke(new Action(() =>
             {
                 LoadAssets();
-                this.Invalidate();
+                if (!isHeadless) this.Invalidate();
             }));
         }
 
         private void ApplyConfigToUi()
         {
             if (animationTimer != null) animationTimer.Interval = config.AnimationDelayMs;
-            this.BackColor = ColorTranslator.FromHtml(config.ChromaKeyColor);
-            this.Invalidate();
+            if (!isHeadless)
+            {
+                this.BackColor = ColorTranslator.FromHtml(config.ChromaKeyColor);
+                this.Invalidate();
+            }
         }
 
         private void InitializeOverlayWindow()
@@ -269,6 +325,20 @@ namespace triclapclap
             this.TopMost = false;
             this.DoubleBuffered = true;
             this.BackColor = ColorTranslator.FromHtml(config.ChromaKeyColor);
+
+            if (isHeadless)
+            {
+                trayIcon = new NotifyIcon
+                {
+                    Icon = SystemIcons.Application,
+                    Text = "triclapclap (Headless)",
+                    Visible = true
+                };
+
+                ContextMenuStrip trayMenu = new ContextMenuStrip();
+                trayMenu.Items.Add("Exit", null, (s, e) => this.Close());
+                trayIcon.ContextMenuStrip = trayMenu;
+            }
         }
 
         private void InitializeComponentManual()
@@ -528,7 +598,7 @@ namespace triclapclap
                 animationTimer.Start();
             }
 
-            this.Invalidate();
+            if (!isHeadless) this.Invalidate();
             BroadcastData(playSoundEvent: true);
         }
 
@@ -539,7 +609,7 @@ namespace triclapclap
             {
                 animationTimer.Stop();
             }
-            this.Invalidate();
+            if (!isHeadless) this.Invalidate();
             BroadcastData(playSoundEvent: false);
         }
 
@@ -568,13 +638,22 @@ namespace triclapclap
 
             if (changed)
             {
-                this.Invalidate();
+                if (!isHeadless) this.Invalidate();
                 BroadcastData(playSoundEvent: false);
+            }
+
+            if (totalHits != lastSavedHits && (now - lastSaveTicks) > 5000)
+            {
+                SaveTotalHits();
+                lastSavedHits = totalHits;
+                lastSaveTicks = now;
             }
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (isHeadless) return;
+
             base.OnPaint(e);
 
             if (config.IsTextAboveAssets)
