@@ -8,7 +8,9 @@ A lightweight input overlay application for OBS Studio.
 * **WebSocket Server:** Real-time broadcasting of animation frames and counters for seamless Browser Source integration.
 
 ---
+
 ## How to use
+
 ### Method 1: Browser Source Integration (Recommended)
 *Provides perfect alpha-transparency for character assets without chroma key artifacts.*
 
