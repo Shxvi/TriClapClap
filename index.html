@@ -1,36 +1,90 @@
 <!DOCTYPE html>
-<html>
 <head>
-    <meta charset="utf-8">
     <style>
-        body { margin: 0; padding: 0; overflow: hidden; background-color: transparent; }
-        #container { position: relative; width: 1024px; height: 576px; }
-        #avatar { position: absolute; top: 0; left: 0; width: 1024px; height: 576px; z-index: 2; }
+        body { 
+            margin: 0; padding: 0; overflow: hidden; background-color: transparent; 
+        }
+        #container { 
+            position: relative; width: 1024px; height: 576px; 
+            contain: strict;
+        }
+        .avatar-frame { 
+            position: absolute; top: 0; left: 0; width: 1024px; height: 576px; 
+            z-index: 2; display: none;
+            will-change: transform, opacity;
+        }
+        .avatar-frame.active {
+            display: block;
+        }
         #ui-text {
             position: absolute; top: 20px; left: 20px; color: #FFFFFF;
-            font-family: 'Consolas', sans-serif; font-size: 28px; font-weight: bold;
+            font-family: 'Consolas', sans-serif; font-size: 80px; font-weight: bold;
             line-height: 1.2; z-index: 1;
             text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000;
+            will-change: contents;
         }
     </style>
 </head>
 <body>
     <div id="container">
         <div id="ui-text">hits: <span id="hits">0</span><br>cps: <span id="cps">0</span></div>
-        <img id="avatar" src="Assets/PlayArea-0.png" />
     </div>
     <script>
-        const imgElement = document.getElementById('avatar');
+        const container = document.getElementById('container');
         const hitsElement = document.getElementById('hits');
         const cpsElement = document.getElementById('cps');
-        const socket = new WebSocket('ws://localhost:8080/');
-        socket.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            hitsElement.innerText = data.totalHits;
-            cpsElement.innerText = data.cps;
-            const targetSrc = 'Assets/' + data.frame;
-            if (imgElement.getAttribute('src') !== targetSrc) { imgElement.src = targetSrc; }
-        };
+
+        const frameNames = [
+            'PlayArea-0.png',
+            'PlayArea-Hit-0.png',
+            'PlayArea-Hit-1.png',
+            'PlayArea-Hit-2.png',
+            'PlayArea-Hit-4.png',
+            'PlayArea-Hit-5.png',
+            'PlayArea-Hit-6.png'
+        ];
+
+        const frameElements = {};
+        let currentActiveFrame = 'PlayArea-0.png';
+
+        frameNames.forEach(name => {
+            const img = new Image(1024, 576);
+            img.className = 'avatar-frame';
+            img.src = 'Assets/' + name;
+            if (name === currentActiveFrame) {
+                img.classList.add('active');
+            }
+            container.appendChild(img);
+            frameElements[name] = img;
+        });
+
+        function connect() {
+            const socket = new WebSocket('ws://localhost:8080/');
+
+            socket.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                hitsElement.textContent = data.totalHits;
+                cpsElement.textContent = data.cps;
+
+                const nextFrame = data.frame;
+                if (currentActiveFrame !== nextFrame && frameElements[nextFrame]) {
+                    frameElements[currentActiveFrame].classList.remove('active');
+                    frameElements[nextFrame].classList.add('active');
+                    currentActiveFrame = nextFrame;
+                }
+            };
+
+            socket.onclose = function() {
+                setTimeout(connect, 2000);
+            };
+
+            socket.onerror = function() {
+                socket.close();
+            };
+        }
+
+        connect();
     </script>
 </body>
 </html>
