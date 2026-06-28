@@ -1,3 +1,5 @@
+[English](readme.md) | [Русский](readme_ru.md)
+---
 # triclapclap
 A lightweight input overlay application for OBS Studio.
 
