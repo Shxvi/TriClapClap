@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_version:
-        description: 'Версия релиза (например: v1.0.0)'
+        description: 'Version (example: v1.0.0)'
         required: true
         type: string
 
@@ -33,15 +33,14 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
-    - name: Build Application
-      run: dotnet build -c Release
+    - name: Publish Application
+      run: dotnet publish -c Release -o ./publish_output
 
     - name: Package Release
       shell: powershell
       run: |
-        Copy-Item -Path "config.json" -Destination "bin\Release\net10.0-windows\" -ErrorAction SilentlyContinue
-        Copy-Item -Path "index.html" -Destination "bin\Release\net10.0-windows\" -ErrorAction SilentlyContinue
-        Compress-Archive -Path "bin\Release\net10.0-windows\*" -DestinationPath "triclapclap-${{ github.event.inputs.tag_version }}.zip"
+        Copy-Item -Path "config.json" -Destination "./publish_output/" -ErrorAction SilentlyContinue
+        Compress-Archive -Path "./publish_output/*" -DestinationPath "triclapclap-${{ github.event.inputs.tag_version }}.zip"
 
     - name: Create Release
       uses: softprops/action-gh-release@v2

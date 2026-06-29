@@ -1,16 +1,43 @@
-<!DOCTYPE html>
-<html lang="ru">
 <head>
-    <meta charset="utf-8">
     <style>
-        body { margin: 0; padding: 0; overflow: hidden; background-color: transparent; }
-        #container { position: relative; width: 1024px; height: 576px; }
-        #avatar { position: absolute; top: 0; left: 0; width: 1024px; height: 576px; z-index: 2; }
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: transparent;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+        }
+
+        #avatar {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            z-index: 2;
+            will-change: contents;
+        }
+
         #ui-text {
-            position: absolute; top: 20px; left: 20px; color: #FFFFFF;
-            font-family: 'Consolas', sans-serif; font-size: 80px; font-weight: bold;
-            line-height: 1.2; z-index: 1;
+            position: absolute;
+            top: 3.5vh;
+            left: 2vw;
+            color: #FFFFFF;
+            font-family: 'Consolas', sans-serif;
+            font-size: 80px;
+            font-weight: bold;
+            line-height: 1.2;
+            z-index: 1;
             text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000;
+            will-change: contents;
         }
     </style>
 </head>
@@ -24,38 +51,72 @@
         const hitsElement = document.getElementById('hits');
         const cpsElement = document.getElementById('cps');
 
-        const AUDIO_CHANNELS_COUNT = 10;
-        const audioPool = [];
-        let currentChannel = 0;
+        const frameNames = [
+        'PlayArea-0.png', 'PlayArea-1.png', 'PlayArea-Hit-0.png',
+        'PlayArea-Hit-1.png', 'PlayArea-Hit-2.png', 'PlayArea-Hit-4.png',
+        'PlayArea-Hit-5.png', 'PlayArea-Hit-6.png'
+        ];
+        const imageCache = new Map();
 
-        for (let i = 0; i < AUDIO_CHANNELS_COUNT; i++) {
-            const audio = new Audio('Assets/slap.wav');
-            audio.buffer = true;
-            audioPool.push(audio);
-        }
+        frameNames.forEach(name => {
+        const img = new Image();
+        img.src = 'Assets/' + name;
+        imageCache.set(name, img.src);
+        });
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let slapBuffer = null;
+
+        fetch('Assets/slap.wav')
+        .then(res => res.arrayBuffer())
+        .then(data => audioCtx.decodeAudioData(data))
+        .then(buffer => slapBuffer = buffer)
+        .catch(() => {});
 
         function playStreamSound() {
-            const sound = audioPool[currentChannel];
-            sound.currentTime = 0;
-            sound.play().catch(err => {});
-            currentChannel = (currentChannel + 1) % AUDIO_CHANNELS_COUNT;
+        if (!slapBuffer) return;
+
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = slapBuffer;
+        source.connect(audioCtx.destination);
+        source.start(0);
         }
 
-        const socket = new WebSocket('ws://localhost:8080/');
-        socket.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            hitsElement.textContent = data.totalHits;
-            cpsElement.textContent = data.cps;
-            
-            if (data.playSound) {
-                playStreamSound();
-            }
+        let socket;
+        function connect() {
+        socket = new WebSocket('ws://localhost:8080/');
 
-            const targetSrc = 'Assets/' + data.frame;
-            if (imgElement.getAttribute('src') !== targetSrc) { 
-                imgElement.src = targetSrc; 
-            }
+        socket.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+
+        if (hitsElement.textContent !== data.totalHits.toString()) {
+        hitsElement.textContent = data.totalHits;
+        }
+        if (cpsElement.textContent !== data.cps.toString()) {
+        cpsElement.textContent = data.cps;
+        }
+
+        if (data.playSound) {
+        playStreamSound();
+        }
+
+        const targetSrc = imageCache.get(data.frame) || ('Assets/' + data.frame);
+        if (imgElement.src !== targetSrc) {
+        imgElement.src = targetSrc;
+        }
         };
+
+        socket.onclose = function() {
+        setTimeout(connect, 2000);
+        };
+
+        socket.onerror = function() {
+        socket.close();
+        };
+        }
+
+        connect();
     </script>
 </body>
-</html>
